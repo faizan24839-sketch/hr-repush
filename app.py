@@ -364,36 +364,37 @@ else:
                         ].copy()
 
                         # 1. pending claims
-                        pending_claims = get_pending_claims(receipt_src, clm)
+                        pending_claims = get_pending_claims(receipt_src, clm).copy()
 
                         # 2. invoice lines
                         if r != parent:
-                            # CHILD: filter non-blank SNInvoiceNumber, VLOOKUP vs receipt app
-                            inv_mask = receipt_src['SNInvoiceNumber'].notna() & (receipt_src['SNInvoiceNumber'].str.strip() != '')
-                            inv_lines = receipt_src[inv_mask].copy()
-                            # get sumif for this child
-                            child_entry = next(c for c in child_sn_sumifs if c['idx'] == i)
-                            sn_sumif = child_entry['sn_sumif']
-                            # unique SN numbers
-                            unique_sns = list(sn_sumif.keys())
-                            # for each row, use sumif amount (negated) as AmountApplied
-                            inv_lines['AmountApplied'] = inv_lines['SNInvoiceNumber'].map(
-                                lambda sn: -sn_sumif.get(sn, 0)
-                            )
-                            # deduplicate to unique SN rows
-                            inv_lines = inv_lines.drop_duplicates(subset=['SNInvoiceNumber']).copy()
-                            # vlookup vs child receipt app
-                            inv_lines['VLOOKUP'] = inv_lines['TransactionNumber'].apply(
-                                lambda t: t if str(t).strip() in applied_refs else None
-                            )
-                            pending_invoices = inv_lines[inv_lines['VLOOKUP'].isna()].copy()
-                            src_cols = [c for c in receipt_src.columns]
-                            pending_invoices = pending_invoices[[c for c in src_cols if c in pending_invoices.columns]].copy()
+                            # check if child has any SNInvoiceNumber lines
+                            has_sn = receipt_src['SNInvoiceNumber'].notna() & (receipt_src['SNInvoiceNumber'].str.strip() != '')
+                            if has_sn.any():
+                                # CHILD with shared invoices: SNInvoiceNumber SUMIF path
+                                inv_lines = receipt_src[has_sn].copy()
+                                child_entry = next(c for c in child_sn_sumifs if c['idx'] == i)
+                                sn_sumif = child_entry['sn_sumif']
+                                inv_lines['AmountApplied'] = inv_lines['SNInvoiceNumber'].map(
+                                    lambda sn: -sn_sumif.get(sn, 0)
+                                )
+                                inv_lines = inv_lines.drop_duplicates(subset=['SNInvoiceNumber']).copy()
+                                inv_lines['VLOOKUP'] = inv_lines['TransactionNumber'].apply(
+                                    lambda t: t if str(t).strip() in applied_refs else None
+                                )
+                                pending_invoices = inv_lines[inv_lines['VLOOKUP'].isna()].copy()
+                                src_cols = [c for c in receipt_src.columns]
+                                pending_invoices = pending_invoices[[c for c in src_cols if c in pending_invoices.columns]].copy()
+                            else:
+                                # CHILD claims-only: no SN invoices, all rows are claims already handled above
+                                pending_invoices = pd.DataFrame(columns=pending_claims.columns)
+                                pending_invoices['AmountApplied'] = pd.to_numeric(pending_invoices['AmountApplied'], errors='coerce')
                             # fix receipt number and customer account
-                            pending_invoices['ReceiptNumber'] = rn
-                            pending_invoices['CustomerAccountNumber'] = acct
                             pending_claims['ReceiptNumber'] = rn
                             pending_claims['CustomerAccountNumber'] = acct
+                            if len(pending_invoices) > 0:
+                                pending_invoices['ReceiptNumber'] = rn
+                                pending_invoices['CustomerAccountNumber'] = acct
 
                         else:
                             # PARENT: two sets of invoice lines
