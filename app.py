@@ -307,7 +307,7 @@ else:
         for i, r in enumerate(receipts):
             if not r['receipt_number'].strip(): errors.append(f"{r['label']}: receipt number required.")
             if not r['customer_account'].strip(): errors.append(f"{r['label']}: customer account required.")
-            if r['unapplied'] == 0.0: errors.append(f"{r['label']}: unapplied amount cannot be zero.")
+            if r['unapplied'] == 0.0: st.info(f"{r['label']} ({r['receipt_number']}) has unapplied amount of 0.00 — will be skipped.")
             if not rap_files.get(i): errors.append(f"{r['label']}: receipt application file missing.")
 
         for e in errors:
@@ -348,6 +348,9 @@ else:
 
                     # process each receipt
                     for i, r in enumerate(receipts):
+                        if r['unapplied'] == 0.0:
+                            st.markdown(f'<div class="status-warn">⚠ {r["label"]} ({r["receipt_number"]}) — unapplied amount is 0.00, skipping.</div>', unsafe_allow_html=True)
+                            continue
                         acct = r['customer_account'].strip()
                         rn = r['receipt_number'].strip()
                         unapplied = r['unapplied']
