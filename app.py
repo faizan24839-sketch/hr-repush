@@ -410,7 +410,10 @@ else:
                                 return original + child_total  # original is negative, child_total is negative
 
                             inv_lines_sn['AmountApplied'] = inv_lines_sn.apply(get_residual, axis=1)
+                            # sum per unique SN then deduplicate (same as child SUMIF logic)
+                            sn_summed = inv_lines_sn.groupby('SNInvoiceNumber')['AmountApplied'].sum()
                             inv_lines_sn = inv_lines_sn.drop_duplicates(subset=['SNInvoiceNumber']).copy()
+                            inv_lines_sn['AmountApplied'] = inv_lines_sn['SNInvoiceNumber'].map(sn_summed)
                             inv_lines_sn['VLOOKUP'] = inv_lines_sn['TransactionNumber'].apply(
                                 lambda t: t if str(t).strip() in applied_refs else None
                             )
@@ -427,7 +430,36 @@ else:
                             src_cols = [c for c in receipt_src.columns]
                             pending_sn = pending_sn[[c for c in src_cols if c in pending_sn.columns]].copy()
                             pending_txn = pending_txn[[c for c in src_cols if c in pending_txn.columns]].copy()
-                            pending_invoices = pd.concat([pending_sn, pending_txn], ignore_index=True)
+
+                            # C) append child residual transaction tables (children with SN lines only)
+                            # these rows go into the parent file with parent receipt number and parent customer account
+                            child_residual_frames = []
+                            for child_entry in child_sn_sumifs:
+                                if not child_entry['sn_sumif']:
+                                    # claims-only child (e.g. SAMDS) - no SN lines, skip
+                                    continue
+                                child_r = child_entry['receipt']
+                                child_acct = child_r['customer_account'].strip()
+                                child_src = src_full[src_full['Item Account Number'].str.strip() == child_acct].copy()
+                                # get child SN invoice lines
+                                child_sn_mask = child_src['SNInvoiceNumber'].notna() & (child_src['SNInvoiceNumber'].str.strip() != '')
+                                child_inv = child_src[child_sn_mask].copy()
+                                if len(child_inv) == 0:
+                                    continue
+                                # apply negated sumif amounts
+                                sn_sumif = child_entry['sn_sumif']
+                                child_summed = child_inv.groupby('SNInvoiceNumber')['AmountApplied'].sum()
+                                child_inv = child_inv.drop_duplicates(subset=['SNInvoiceNumber']).copy()
+                                child_inv['AmountApplied'] = child_inv['SNInvoiceNumber'].map(
+                                    lambda sn: -sn_sumif.get(sn, 0)
+                                )
+                                child_inv = child_inv[[c for c in src_cols if c in child_inv.columns]].copy()
+                                # set parent receipt number and customer account
+                                child_inv['ReceiptNumber'] = rn
+                                child_inv['CustomerAccountNumber'] = r['customer_account'].strip()
+                                child_residual_frames.append(child_inv)
+
+                            pending_invoices = pd.concat([pending_sn, pending_txn] + child_residual_frames, ignore_index=True)
 
                         repush, total, status, dropped = reconcile_and_drop(pending_claims, pending_invoices, unapplied)
 
