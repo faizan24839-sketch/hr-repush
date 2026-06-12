@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 from html.parser import HTMLParser
-from io import StringIO
+from io import StringIO, BytesIO
+import zipfile
 
 st.set_page_config(page_title="HR Repush Builder", page_icon="⬡", layout="centered")
 
@@ -147,6 +148,92 @@ def to_pipe_txt(df, receipt_number, iteration=1):
     buf = StringIO()
     df.to_csv(buf, sep='|', index=False)
     return buf.getvalue().encode('utf-8'), f"{receipt_number}_Reconstructed_{iteration}.txt"
+
+
+# ── parent/child core ──────────────────────────────────────────────────────────
+# A claim line has a BLANK TransactionNumber and a POPULATED SNInvoiceNumber.
+# A transaction line has a POPULATED TransactionNumber and a BLANK SNInvoiceNumber.
+# The TransactionNumber on a txn line equals the SNInvoiceNumber on the claim lines
+# it settles, which is the key that ties them together.
+
+def _txn_mask(s):
+    return ~(s['TransactionNumber'].isna() | (s['TransactionNumber'].str.strip() == ''))
+
+
+def build_sum_sn(child_src):
+    """sum_sn: from a child's CLAIM rows, group by SNInvoiceNumber, sum AmountApplied.
+    Values stay negative. Used to derive each child transaction's pushable amount."""
+    claims = child_src[child_src['TransactionNumber'].isna() | (child_src['TransactionNumber'].str.strip() == '')]
+    if len(claims) == 0:
+        return {}
+    return claims.groupby(claims['SNInvoiceNumber'].str.strip())['AmountApplied'].sum().to_dict()
+
+
+def build_child_pending(receipt_src, claims_df, sn_map, applied_refs, rn, acct):
+    """Child file rows:
+       claims  -> pending claims, original source columns/amounts, untouched
+       txns    -> AmountApplied overwritten with (-1 * sum_sn[TransactionNumber]); 0 if no match
+       Both VLOOKUP'd against the CHILD receipt application; NA rows kept.
+       ReceiptNumber (col C) and CustomerAccountNumber (col L) stamped to child values."""
+    src_cols = list(receipt_src.columns)
+    pending_claims = get_pending_claims(receipt_src, claims_df).copy()
+
+    txn = receipt_src[_txn_mask(receipt_src)].copy()
+    txn['AmountApplied'] = txn['TransactionNumber'].str.strip().map(lambda t: -sn_map.get(t, 0))
+    txn['__vlk'] = txn['TransactionNumber'].apply(lambda t: t if str(t).strip() in applied_refs else None)
+    pending_invoices = txn[txn['__vlk'].isna()][src_cols].copy()
+
+    for d in (pending_claims, pending_invoices):
+        if len(d) > 0:
+            d['ReceiptNumber'] = rn
+            d['CustomerAccountNumber'] = acct
+    return pending_claims, pending_invoices
+
+
+def build_parent_pending(receipt_src, claims_df, applied_refs, parent_rn, parent_acct,
+                         child_entries, src_full):
+    """Parent file rows:
+       claims         -> parent's own pending claims, original columns/amounts
+       own txns       -> parent's own transaction lines, ORIGINAL amounts, VLOOKUP vs parent RAP
+       child residual -> for each child with txn rows: new O = original O + sum_sn[txn] (O+Q),
+                         no dedup, VLOOKUP vs PARENT RAP, stamped with parent receipt/account.
+       Claims-only children (no txn rows, e.g. DS accounts) are skipped here."""
+    src_cols = list(receipt_src.columns)
+    pending_claims = get_pending_claims(receipt_src, claims_df).copy()
+
+    own = receipt_src[_txn_mask(receipt_src)].copy()
+    own['__vlk'] = own['TransactionNumber'].apply(lambda t: t if str(t).strip() in applied_refs else None)
+    frames = [own[own['__vlk'].isna()][src_cols].copy()]
+
+    for ce in child_entries:
+        sn_map, cacct = ce['sn_map'], ce['acct']
+        ctxn = src_full[src_full['Item Account Number'].str.strip() == cacct].copy()
+        ctxn = ctxn[_txn_mask(ctxn)].copy()
+        if len(ctxn) == 0:
+            continue  # claims-only child, no residual contribution to parent
+        ctxn['__q'] = ctxn['TransactionNumber'].str.strip().map(lambda t: sn_map.get(t, 0))
+        ctxn['AmountApplied'] = ctxn['AmountApplied'] + ctxn['__q']
+        ctxn['__vlk'] = ctxn['TransactionNumber'].apply(lambda t: t if str(t).strip() in applied_refs else None)
+        keep = ctxn[ctxn['__vlk'].isna()][src_cols].copy()
+        keep['ReceiptNumber'] = parent_rn
+        keep['CustomerAccountNumber'] = parent_acct
+        frames.append(keep)
+
+    pending_invoices = pd.concat(frames, ignore_index=True)
+    if len(pending_claims) > 0:
+        pending_claims['ReceiptNumber'] = parent_rn
+        pending_claims['CustomerAccountNumber'] = parent_acct
+    return pending_claims, pending_invoices
+
+
+def zip_outputs(output_files):
+    """Bundle (bytes, filename) tuples into a single zip for one-click download."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for file_bytes, filename in output_files:
+            zf.writestr(filename, file_bytes)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def recon_status_html(status, total, unapplied, dropped_rows, label=""):
@@ -307,7 +394,6 @@ else:
         for i, r in enumerate(receipts):
             if not r['receipt_number'].strip(): errors.append(f"{r['label']}: receipt number required.")
             if not r['customer_account'].strip(): errors.append(f"{r['label']}: customer account required.")
-            if r['unapplied'] == 0.0: st.info(f"{r['label']} ({r['receipt_number']}) has unapplied amount of 0.00 — will be skipped.")
             if not rap_files.get(i): errors.append(f"{r['label']}: receipt application file missing.")
 
         for e in errors:
@@ -317,171 +403,118 @@ else:
             with st.spinner("Processing all receipts..."):
                 try:
                     clm = read_claims_headers(claims_file)
-                    # read source once — filter per receipt by customer account
+                    # read source once — filter per receipt by Item Account Number (col Y)
                     src_full = pd.read_csv(source_file, sep='|', dtype=str)
                     src_full.columns = src_full.columns.str.strip()
                     src_full['AmountApplied'] = pd.to_numeric(src_full['AmountApplied'], errors='coerce')
 
-                    # identify children and parent
-                    children = [r for r in receipts if 'parent' not in r['label'].lower()]
+                    # identify parent and children
                     parent = next((r for r in receipts if 'parent' in r['label'].lower()), receipts[-1])
-                    parent_idx = receipts.index(parent)
 
-                    # build child SNInvoiceNumber SUMIF lookup per child
-                    # for each child, get unique SNInvoiceNumber -> summed AmountApplied
-                    child_sn_sumifs = []  # list of dicts: {sn_number: summed_amount}
+                    # build a sum_sn map per child (from each child's CLAIM rows)
+                    child_entries = []
                     for i, r in enumerate(receipts):
-                        if r == parent: continue
-                        acct = r['customer_account'].strip()
-                        child_src = src_full[
-                            src_full['Item Account Number'].str.strip() == acct
-                        ].copy()
-                        # invoice lines: non-blank SNInvoiceNumber
-                        inv_mask = child_src['SNInvoiceNumber'].notna() & (child_src['SNInvoiceNumber'].str.strip() != '')
-                        inv_lines = child_src[inv_mask].copy()
-                        # sumif per unique SNInvoiceNumber
-                        sn_sumif = inv_lines.groupby('SNInvoiceNumber')['AmountApplied'].sum().to_dict()
-                        child_sn_sumifs.append({'receipt': r, 'idx': i, 'sn_sumif': sn_sumif})
-
-                    st.markdown("### Results")
-                    output_files = []
-
-                    # process each receipt
-                    for i, r in enumerate(receipts):
-                        if r['unapplied'] == 0.0:
-                            st.markdown(f'<div class="status-warn">⚠ {r["label"]} ({r["receipt_number"]}) — unapplied amount is 0.00, skipping.</div>', unsafe_allow_html=True)
+                        if r is parent:
                             continue
+                        acct = r['customer_account'].strip()
+                        csrc = src_full[src_full['Item Account Number'].str.strip() == acct].copy()
+                        child_entries.append({
+                            'idx': i, 'receipt': r, 'acct': acct,
+                            'rn': r['receipt_number'].strip(),
+                            'sn_map': build_sum_sn(csrc),
+                        })
+
+                    results = []  # each: dict with everything needed to render + download
+
+                    for i, r in enumerate(receipts):
                         acct = r['customer_account'].strip()
                         rn = r['receipt_number'].strip()
                         unapplied = r['unapplied']
                         rap = read_receipt_application(rap_files[i])
                         app_ref_col = 'Application Reference'
-                        applied_refs = set(rap[app_ref_col].astype(str).str.strip().tolist()) if app_ref_col in rap.columns else set()
+                        applied_refs = (set(rap[app_ref_col].astype(str).str.strip().tolist())
+                                        if app_ref_col in rap.columns else set())
 
-                        # filter source by customer account
-                        receipt_src = src_full[
-                            src_full['Item Account Number'].str.strip() == acct
-                        ].copy()
+                        receipt_src = src_full[src_full['Item Account Number'].str.strip() == acct].copy()
 
-                        # 1. pending claims
-                        pending_claims = get_pending_claims(receipt_src, clm).copy()
-
-                        # 2. invoice lines
-                        if r != parent:
-                            # check if child has any SNInvoiceNumber lines
-                            has_sn = receipt_src['SNInvoiceNumber'].notna() & (receipt_src['SNInvoiceNumber'].str.strip() != '')
-                            if has_sn.any():
-                                # CHILD with shared invoices: SNInvoiceNumber SUMIF path
-                                inv_lines = receipt_src[has_sn].copy()
-                                child_entry = next(c for c in child_sn_sumifs if c['idx'] == i)
-                                sn_sumif = child_entry['sn_sumif']
-                                inv_lines['AmountApplied'] = inv_lines['SNInvoiceNumber'].map(
-                                    lambda sn: -sn_sumif.get(sn, 0)
-                                )
-                                inv_lines = inv_lines.drop_duplicates(subset=['SNInvoiceNumber']).copy()
-                                inv_lines['VLOOKUP'] = inv_lines['TransactionNumber'].apply(
-                                    lambda t: t if str(t).strip() in applied_refs else None
-                                )
-                                pending_invoices = inv_lines[inv_lines['VLOOKUP'].isna()].copy()
-                                src_cols = [c for c in receipt_src.columns]
-                                pending_invoices = pending_invoices[[c for c in src_cols if c in pending_invoices.columns]].copy()
-                            else:
-                                # CHILD claims-only: no SN invoices, all rows are claims already handled above
-                                pending_invoices = pd.DataFrame(columns=pending_claims.columns)
-                                pending_invoices['AmountApplied'] = pd.to_numeric(pending_invoices['AmountApplied'], errors='coerce')
-                            # fix receipt number and customer account
-                            pending_claims['ReceiptNumber'] = rn
-                            pending_claims['CustomerAccountNumber'] = acct
-                            if len(pending_invoices) > 0:
-                                pending_invoices['ReceiptNumber'] = rn
-                                pending_invoices['CustomerAccountNumber'] = acct
-
+                        if r is parent:
+                            pending_claims, pending_invoices = build_parent_pending(
+                                receipt_src, clm, applied_refs, rn, acct, child_entries, src_full)
                         else:
-                            # PARENT: two sets of invoice lines
-                            # A) residual lines (have SNInvoiceNumber, shared with children)
-                            inv_mask_sn = receipt_src['SNInvoiceNumber'].notna() & (receipt_src['SNInvoiceNumber'].str.strip() != '')
-                            inv_lines_sn = receipt_src[inv_mask_sn].copy()
+                            ce = next(c for c in child_entries if c['idx'] == i)
+                            pending_claims, pending_invoices = build_child_pending(
+                                receipt_src, clm, ce['sn_map'], applied_refs, rn, acct)
 
-                            # calculate residual: original amount minus all children's sumif amounts for same SN
-                            def get_residual(row):
-                                sn = row['SNInvoiceNumber']
-                                original = row['AmountApplied']
-                                child_total = sum(c['sn_sumif'].get(sn, 0) for c in child_sn_sumifs)
-                                return original + child_total  # original is negative, child_total is negative
+                        n_pending = len(pending_claims) + len(pending_invoices)
 
-                            inv_lines_sn['AmountApplied'] = inv_lines_sn.apply(get_residual, axis=1)
-                            # sum per unique SN then deduplicate (same as child SUMIF logic)
-                            sn_summed = inv_lines_sn.groupby('SNInvoiceNumber')['AmountApplied'].sum()
-                            inv_lines_sn = inv_lines_sn.drop_duplicates(subset=['SNInvoiceNumber']).copy()
-                            inv_lines_sn['AmountApplied'] = inv_lines_sn['SNInvoiceNumber'].map(sn_summed)
-                            inv_lines_sn['VLOOKUP'] = inv_lines_sn['TransactionNumber'].apply(
-                                lambda t: t if str(t).strip() in applied_refs else None
-                            )
-                            pending_sn = inv_lines_sn[inv_lines_sn['VLOOKUP'].isna()].copy()
+                        # SKIP RULE: only when nothing is left to push after RAP matching.
+                        # unapplied = 0.00 alone does NOT skip — a freshly-created receipt
+                        # (nothing applied) also reads 0.00 and must still generate.
+                        if n_pending == 0:
+                            results.append({
+                                'skipped': True, 'label': r['label'], 'rn': rn,
+                                'reason': 'All lines already applied in Oracle — nothing to reconstruct.',
+                            })
+                            continue
 
-                            # B) direct parent invoice lines (non-blank TransactionNumber, no SNInvoiceNumber filter)
-                            inv_mask_txn = receipt_src['TransactionNumber'].notna() & (receipt_src['TransactionNumber'].str.strip() != '')
-                            inv_lines_txn = receipt_src[inv_mask_txn].copy()
-                            inv_lines_txn['VLOOKUP'] = inv_lines_txn['TransactionNumber'].apply(
-                                lambda t: t if str(t).strip() in applied_refs else None
-                            )
-                            pending_txn = inv_lines_txn[inv_lines_txn['VLOOKUP'].isna()].copy()
-
-                            src_cols = [c for c in receipt_src.columns]
-                            pending_sn = pending_sn[[c for c in src_cols if c in pending_sn.columns]].copy()
-                            pending_txn = pending_txn[[c for c in src_cols if c in pending_txn.columns]].copy()
-
-                            # C) append child residual transaction tables (children with SN lines only)
-                            # these rows go into the parent file with parent receipt number and parent customer account
-                            child_residual_frames = []
-                            for child_entry in child_sn_sumifs:
-                                if not child_entry['sn_sumif']:
-                                    # claims-only child (e.g. SAMDS) - no SN lines, skip
-                                    continue
-                                child_r = child_entry['receipt']
-                                child_acct = child_r['customer_account'].strip()
-                                child_src = src_full[src_full['Item Account Number'].str.strip() == child_acct].copy()
-                                # get child SN invoice lines
-                                child_sn_mask = child_src['SNInvoiceNumber'].notna() & (child_src['SNInvoiceNumber'].str.strip() != '')
-                                child_inv = child_src[child_sn_mask].copy()
-                                if len(child_inv) == 0:
-                                    continue
-                                # apply negated sumif amounts
-                                sn_sumif = child_entry['sn_sumif']
-                                child_summed = child_inv.groupby('SNInvoiceNumber')['AmountApplied'].sum()
-                                child_inv = child_inv.drop_duplicates(subset=['SNInvoiceNumber']).copy()
-                                child_inv['AmountApplied'] = child_inv['SNInvoiceNumber'].map(
-                                    lambda sn: -sn_sumif.get(sn, 0)
-                                )
-                                child_inv = child_inv[[c for c in src_cols if c in child_inv.columns]].copy()
-                                # set parent receipt number and customer account
-                                child_inv['ReceiptNumber'] = rn
-                                child_inv['CustomerAccountNumber'] = r['customer_account'].strip()
-                                child_residual_frames.append(child_inv)
-
-                            pending_invoices = pd.concat([pending_sn, pending_txn] + child_residual_frames, ignore_index=True)
-
-                        repush, total, status, dropped = reconcile_and_drop(pending_claims, pending_invoices, unapplied)
-
-                        st.markdown(f"#### {r['label']} — {rn}")
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Claims", len(pending_claims))
-                        c2.metric("Invoices", len(pending_invoices))
-                        c3.metric("Total", f"{total:,.2f}")
-
-                        st.markdown(recon_status_html(status, total, unapplied, dropped, r['label']), unsafe_allow_html=True)
-
-                        with st.expander(f"Preview — {r['label']}"):
-                            st.dataframe(repush.head(30), use_container_width=True, hide_index=True)
+                        repush, total, status, dropped = reconcile_and_drop(
+                            pending_claims, pending_invoices, unapplied)
 
                         file_bytes, filename = to_pipe_txt(repush, rn)
-                        output_files.append((file_bytes, filename))
+                        results.append({
+                            'skipped': False, 'label': r['label'], 'rn': rn,
+                            'n_claims': len(pending_claims), 'n_invoices': len(pending_invoices),
+                            'total': float(total), 'unapplied': float(unapplied),
+                            'status': status, 'dropped': dropped,
+                            'preview': repush.head(30).to_dict('records'),
+                            'preview_cols': list(repush.columns),
+                            'file_bytes': file_bytes, 'filename': filename,
+                        })
 
-                    st.markdown("---")
-                    st.markdown("### Downloads")
-                    for file_bytes, filename in output_files:
-                        st.download_button(f"↓ DOWNLOAD  {filename}", file_bytes, filename, mime="text/plain", key=f"dl_{filename}")
+                    # persist so download clicks (which rerun the app) don't wipe results
+                    st.session_state.pc_results = results
+                    st.session_state.pc_outputs = [
+                        (r['file_bytes'], r['filename']) for r in results if not r['skipped']
+                    ]
 
                 except Exception as ex:
                     st.markdown(f'<div class="status-err">✗ Error: {str(ex)}</div>', unsafe_allow_html=True)
                     raise ex
+
+    # ── render results from session state (survives download-triggered reruns) ──
+    if st.session_state.get('pc_results'):
+        st.markdown("### Results")
+        for res in st.session_state.pc_results:
+            if res['skipped']:
+                st.markdown(
+                    f'<div class="status-warn">⚠ {res["label"]} ({res["rn"]}) — skipped. {res["reason"]}</div>',
+                    unsafe_allow_html=True)
+                continue
+
+            st.markdown(f"#### {res['label']} — {res['rn']}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Claims", res['n_claims'])
+            c2.metric("Invoices", res['n_invoices'])
+            c3.metric("Total", f"{res['total']:,.2f}")
+
+            st.markdown(
+                recon_status_html(res['status'], res['total'], res['unapplied'],
+                                  res['dropped'], res['label']),
+                unsafe_allow_html=True)
+
+            with st.expander(f"Preview — {res['label']}"):
+                st.dataframe(pd.DataFrame(res['preview'], columns=res['preview_cols']),
+                             use_container_width=True, hide_index=True)
+
+        outputs = st.session_state.get('pc_outputs', [])
+        if outputs:
+            st.markdown("---")
+            st.markdown("### Downloads")
+            if len(outputs) > 1:
+                st.download_button(
+                    f"↓ DOWNLOAD ALL ({len(outputs)} files, .zip)",
+                    zip_outputs(outputs), "repush_files.zip", mime="application/zip",
+                    key="dl_zip_all")
+            for file_bytes, filename in outputs:
+                st.download_button(f"↓ DOWNLOAD  {filename}", file_bytes, filename,
+                                   mime="text/plain", key=f"dl_{filename}")
