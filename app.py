@@ -146,7 +146,13 @@ def reconcile_and_drop(pending_claims, pending_invoices, unapplied_amount):
 
 def to_pipe_txt(df, receipt_number, iteration=1):
     buf = StringIO()
-    df.to_csv(buf, sep='|', index=False)
+    df.to_csv(
+        buf,
+        sep='|',
+        index=False,
+        lineterminator='\r\n',
+        float_format='%.2f',
+    )
     return buf.getvalue().encode('utf-8'), f"{receipt_number}_Reconstructed_{iteration}.txt"
 
 
