@@ -189,10 +189,11 @@ def build_child_pending(receipt_src, claims_df, sn_map, applied_refs, rn, acct):
     txn['__vlk'] = txn['TransactionNumber'].apply(lambda t: t if str(t).strip() in applied_refs else None)
     pending_invoices = txn[txn['__vlk'].isna()][src_cols].copy()
 
-    for d in (pending_claims, pending_invoices):
+   for d in (pending_claims, pending_invoices):
         if len(d) > 0:
             d['ReceiptNumber'] = rn
             d['CustomerAccountNumber'] = acct
+            d['CustomerName'] = d['Item Customer Name']
     return pending_claims, pending_invoices
 
 
