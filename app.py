@@ -3,6 +3,7 @@ import pandas as pd
 from html.parser import HTMLParser
 from io import StringIO, BytesIO
 import zipfile
+import json
 
 st.set_page_config(page_title="HR Repush Builder", page_icon="⬡", layout="centered")
 
@@ -156,6 +157,78 @@ def to_pipe_txt(df, receipt_number, iteration=1):
     return buf.getvalue().encode('utf-8'), f"{receipt_number}_Reconstructed_{iteration}.txt"
 
 
+# ── receipt creation ──────────────────────────────────────────────────────────
+
+def build_receipt_payloads(src_full, receipt_number):
+    """Given the full source dataframe and a target receipt number, return a dict
+    with parent payload, child payloads, and R2R lines for any DS child."""
+    sub = src_full[src_full['ReceiptNumber'].str.strip() == str(receipt_number).strip()].copy()
+    if sub.empty:
+        return None
+
+    h = sub.iloc[0]
+    paying = h['CustomerAccountNumber'].strip()
+
+    # children in order of first appearance
+    seen = []
+    for acct in sub['Item Account Number']:
+        a = acct.strip() if isinstance(acct, str) else ''
+        if a and a not in seen:
+            seen.append(a)
+    children = [a for a in seen if a != paying]
+
+    def _amount_from_header(v):
+        try: return float(v)
+        except: return v
+
+    parent = {
+        "AccountingDate": h['AccountingDate'],
+        "RemittanceBankAccountNumber": h['BankAccountNumber'],
+        "ConversionRateType": h['ConversionRateType'],
+        "Currency": h['CurrencyCode'],
+        "CustomerName": h['CustomerName'],
+        "ReceiptNumber": str(receipt_number).strip(),
+        "Amount": _amount_from_header(h['ReceiptAmount']),
+        "CustomerAccountNumber": paying,
+        "BusinessUnit": h['BusinessUnit'],
+        "StructuredPaymentReference": h['StructuredPaymentReference'],
+        "ReceiptDate": h['ReceiptDate'],
+        "ConversionDate": h['ConversionDate'],
+    }
+
+    child_payloads = []
+    r2r_lines = []
+    for idx, ch in enumerate(children, start=1):
+        ch_rows = sub[sub['Item Account Number'].str.strip() == ch]
+        ch_name = ch_rows['Item Customer Name'].iloc[0]
+        child_rn = f"{str(receipt_number).strip()}_{idx}"
+        child_payloads.append({
+            "AccountingDate": h['AccountingDate'],
+            "RemittanceBankAccountNumber": h['BankAccountNumber'],
+            "ConversionRateType": h['ConversionRateType'],
+            "Currency": h['CurrencyCode'],
+            "CustomerName": ch_name,
+            "ReceiptNumber": child_rn,
+            "Amount": 0,
+            "CustomerAccountNumber": ch,
+            "BusinessUnit": h['BusinessUnit'],
+            "StructuredPaymentReference": h['StructuredPaymentReference'],
+            "ReceiptDate": h['ReceiptDate'],
+            "ConversionDate": h['ConversionDate'],
+        })
+        if ch.endswith('DS'):
+            child_amount = pd.to_numeric(ch_rows['AmountApplied'], errors='coerce').sum()
+            r2r_lines.append({
+                "BU": h['BusinessUnit'],
+                "ReceiptNumber": str(receipt_number).strip(),
+                "ChildReceiptNumber": child_rn,
+                "ChildAmount": round(float(child_amount), 2),
+                "Date": h['AccountingDate'],
+            })
+
+    return {"parent": parent, "children": child_payloads, "r2r": r2r_lines}
+
+
 # ── parent/child core ──────────────────────────────────────────────────────────
 # A claim line has a BLANK TransactionNumber and a POPULATED SNInvoiceNumber.
 # A transaction line has a POPULATED TransactionNumber and a BLANK SNInvoiceNumber.
@@ -180,7 +253,8 @@ def build_child_pending(receipt_src, claims_df, sn_map, applied_refs, rn, acct):
        claims  -> pending claims, original source columns/amounts, untouched
        txns    -> AmountApplied overwritten with (-1 * sum_sn[TransactionNumber]); 0 if no match
        Both VLOOKUP'd against the CHILD receipt application; NA rows kept.
-       ReceiptNumber (col C) and CustomerAccountNumber (col L) stamped to child values."""
+       ReceiptNumber (col C), CustomerAccountNumber (col L), CustomerName (col K)
+       stamped to child values (CustomerName pulled from Item Customer Name col Z)."""
     src_cols = list(receipt_src.columns)
     pending_claims = get_pending_claims(receipt_src, claims_df).copy()
 
@@ -189,7 +263,7 @@ def build_child_pending(receipt_src, claims_df, sn_map, applied_refs, rn, acct):
     txn['__vlk'] = txn['TransactionNumber'].apply(lambda t: t if str(t).strip() in applied_refs else None)
     pending_invoices = txn[txn['__vlk'].isna()][src_cols].copy()
 
-   for d in (pending_claims, pending_invoices):
+    for d in (pending_claims, pending_invoices):
         if len(d) > 0:
             d['ReceiptNumber'] = rn
             d['CustomerAccountNumber'] = acct
@@ -268,7 +342,7 @@ st.markdown("""
 
 # mode selector
 st.markdown('<div class="section-label">Receipt Type</div>', unsafe_allow_html=True)
-mode = st.radio("", ["Standalone", "Parent / Child"], horizontal=True, label_visibility="collapsed")
+mode = st.radio("", ["Standalone", "Parent / Child", "Receipt Creation"], horizontal=True, label_visibility="collapsed")
 
 st.markdown("---")
 
@@ -276,8 +350,11 @@ st.markdown("---")
 st.markdown('<div class="section-label">Source File (.txt pipe-delimited)</div>', unsafe_allow_html=True)
 source_file = st.file_uploader("", type=["txt"], key="source", label_visibility="collapsed")
 
-st.markdown('<div class="section-label">Open Claims Headers Extract (.xlsx)</div>', unsafe_allow_html=True)
-claims_file = st.file_uploader("", type=["xlsx"], key="claims", label_visibility="collapsed")
+if mode in ("Standalone", "Parent / Child"):
+    st.markdown('<div class="section-label">Open Claims Headers Extract (.xlsx)</div>', unsafe_allow_html=True)
+    claims_file = st.file_uploader("", type=["xlsx"], key="claims", label_visibility="collapsed")
+else:
+    claims_file = None
 
 st.markdown("---")
 
@@ -346,7 +423,7 @@ if mode == "Standalone":
                     raise ex
 
 # ── PARENT / CHILD MODE ────────────────────────────────────────────────────────
-else:
+elif mode == "Parent / Child":
     # init session state
     if 'pc_receipts' not in st.session_state:
         st.session_state.pc_receipts = [
@@ -525,3 +602,86 @@ else:
             for file_bytes, filename in outputs:
                 st.download_button(f"↓ DOWNLOAD  {filename}", file_bytes, filename,
                                    mime="text/plain", key=f"dl_{filename}")
+
+# ── RECEIPT CREATION MODE ─────────────────────────────────────────────────────
+elif mode == "Receipt Creation":
+    st.markdown('<div class="section-label">Receipt Numbers (one per line)</div>', unsafe_allow_html=True)
+    receipt_numbers_text = st.text_area(
+        "",
+        placeholder="4024385\n2000940653\n365367591",
+        height=120,
+        key="rc_rns",
+        label_visibility="collapsed"
+    )
+
+    st.markdown("---")
+    run_rc = st.button("BUILD RECEIPT PAYLOADS")
+
+    if run_rc:
+        errors = []
+        if not source_file: errors.append("Source file missing.")
+        rns = [r.strip() for r in receipt_numbers_text.splitlines() if r.strip()]
+        if not rns: errors.append("At least one receipt number required.")
+
+        for e in errors:
+            st.markdown(f'<div class="status-err">✗ {e}</div>', unsafe_allow_html=True)
+
+        if not errors:
+            with st.spinner("Building payloads..."):
+                try:
+                    src_full = pd.read_csv(source_file, sep='|', dtype=str)
+                    src_full.columns = src_full.columns.str.strip()
+
+                    results = []
+                    for rn in rns:
+                        payload = build_receipt_payloads(src_full, rn)
+                        if payload is None:
+                            results.append({'rn': rn, 'found': False})
+                        else:
+                            results.append({'rn': rn, 'found': True, 'payload': payload})
+
+                    st.session_state.rc_results = results
+
+                except Exception as ex:
+                    st.markdown(f'<div class="status-err">✗ Error: {str(ex)}</div>', unsafe_allow_html=True)
+                    raise ex
+
+    # render results (persists across reruns)
+    if st.session_state.get('rc_results'):
+        st.markdown("### Results")
+        for res in st.session_state.rc_results:
+            if not res['found']:
+                st.markdown(
+                    f'<div class="status-err">✗ Receipt {res["rn"]} not found in source file.</div>',
+                    unsafe_allow_html=True)
+                continue
+
+            p = res['payload']
+            st.markdown(f"#### Receipt {res['rn']}")
+            n_children = len(p['children'])
+            n_r2r = len(p['r2r'])
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Paying Account", p['parent']['CustomerAccountNumber'])
+            c2.metric("Children", n_children)
+            c3.metric("DS / R2R", n_r2r)
+
+            st.markdown('**Parent Payload**')
+            st.code(json.dumps(p['parent'], indent=4), language='json')
+
+            for i, ch in enumerate(p['children'], start=1):
+                st.markdown(f'**Child {i} — {ch["CustomerAccountNumber"]}**')
+                st.code(json.dumps(ch, indent=4), language='json')
+
+            if p['r2r']:
+                st.markdown('**R2R Lines**')
+                for line in p['r2r']:
+                    st.code(
+                        f"BU: {line['BU']}\n"
+                        f"Receipt Number: {line['ReceiptNumber']}\n"
+                        f"Child Receipt Number: {line['ChildReceiptNumber']}\n"
+                        f"Child Amount: {line['ChildAmount']:.2f}\n"
+                        f"Date: {line['Date']}",
+                        language='text')
+
+            st.markdown("---")
